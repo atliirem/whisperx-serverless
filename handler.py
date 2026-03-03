@@ -101,7 +101,7 @@ def handler(job):
                     min_speakers=min_speakers, max_speakers=max_speakers
                 )
                 diarize_result = pd.DataFrame(
-                    [(t.start, t.end, s) for t, _, s in raw.itertracks(yield_label=True)],
+                    [(t.start, t.end, s) for t, _, s in raw.speaker_diarization.itertracks(yield_label=True)],
                     columns=["start", "end", "speaker"]
                 )
                 result = whisperx.assign_word_speakers(diarize_result, result)
