@@ -21,9 +21,7 @@ diarize_model = None
 if HF_TOKEN:
     logger.info("Diarization modeli yukleniyor...")
     try:
-        from pyannote.audio import Pipeline
-        diarize_model = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", token=HF_TOKEN)
-        diarize_model.to(torch.device(DEVICE))
+        diarize_model = whisperx.DiarizePipeline(use_auth_token=HF_TOKEN, device=DEVICE)
         logger.info("Diarization modeli hazir (GPU)!")
     except Exception as e:
         logger.error(f"Diarization yuklenemedi: {e}")
@@ -93,18 +91,9 @@ def handler(job):
         if do_diarize and diarize_model is not None:
             logger.info("Adim 3/3: Konusmaci ayristirma...")
             try:
-                import torchaudio
-                import pandas as pd
-                waveform, sr = torchaudio.load(wav_path)
-                raw = diarize_model(
-                    {"waveform": waveform.to(DEVICE), "sample_rate": sr},
-                    min_speakers=min_speakers, max_speakers=max_speakers
-                )
-                diarize_result = pd.DataFrame(
-                    [(t.start, t.end, s) for t, _, s in raw.speaker_diarization.itertracks(yield_label=True)],
-                    columns=["start", "end", "speaker"]
-                )
-                result = whisperx.assign_word_speakers(diarize_result, result)
+                diarize_segments = diarize_model(audio, min_speakers=min_speakers, max_speakers=max_speakers)
+                result = whisperx.assign_word_speakers(diarize_segments, result)
+                logger.info("Diarization basarili!")
             except Exception as e:
                 logger.warning(f"Konusmaci ayristirma hatasi: {e}")
 
@@ -158,7 +147,6 @@ def handler(job):
             "speaker_text": speaker_text
         }
 
-        # Send to webhook if provided
         if webhook_url:
             try:
                 req.post(webhook_url, json=payload, timeout=30)
