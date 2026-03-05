@@ -91,7 +91,7 @@ def handler(job):
         if do_diarize and diarize_model is not None:
             logger.info("Adim 3/3: Konusmaci ayristirma...")
             try:
-                diarize_segments = diarize_model(audio, min_speakers=min_speakers, max_speakers=max_speakers)
+                diarize_segments = diarize_model(wav_path, min_speakers=min_speakers, max_speakers=max_speakers)
                 result = whisperx.assign_word_speakers(diarize_segments, result)
                 logger.info("Diarization basarili!")
             except Exception as e:
