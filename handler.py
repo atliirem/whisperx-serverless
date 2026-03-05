@@ -25,6 +25,13 @@ if HF_TOKEN:
         logger.info("Diarization modeli hazir (GPU)!")
     except Exception as e:
         logger.error(f"Diarization yuklenemedi: {e}")
+        try:
+            diarize_model = whisperx.DiarizePipeline(token=HF_TOKEN, device=DEVICE)
+            logger.info("Diarization modeli hazir (token param)!")
+        except Exception as e2:
+            logger.error(f"Diarization token ile de yuklenemedi: {e2}")
+else:
+    logger.warning("HF_TOKEN yok, diarization calismayacak!")
 
 
 def preprocess_audio(input_path):
@@ -34,7 +41,9 @@ def preprocess_audio(input_path):
             ["ffmpeg", "-i", input_path, "-ar", "16000", "-ac", "1", "-f", "wav", output_path, "-y"],
             capture_output=True, timeout=120
         )
-        return output_path
+        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+            return output_path
+        return input_path
     except:
         return input_path
 
@@ -73,6 +82,7 @@ def handler(job):
         file_size_mb = os.path.getsize(tmp_path) / (1024 * 1024)
 
         wav_path = preprocess_audio(tmp_path)
+        logger.info(f"WAV dosya boyutu: {round(os.path.getsize(wav_path)/(1024*1024),1)} MB")
 
         logger.info("Adim 1/3: Transkripsiyon...")
         audio = whisperx.load_audio(wav_path)
@@ -88,14 +98,28 @@ def handler(job):
         except Exception as e:
             logger.warning(f"Hizalama atlandi: {e}")
 
+        diarization_ok = False
         if do_diarize and diarize_model is not None:
             logger.info("Adim 3/3: Konusmaci ayristirma...")
             try:
-                diarize_segments = diarize_model(wav_path, min_speakers=min_speakers, max_speakers=max_speakers)
+                diarize_segments = diarize_model(audio, min_speakers=min_speakers, max_speakers=max_speakers)
+                logger.info(f"Diarize segments type: {type(diarize_segments)}")
+                logger.info(f"Diarize segments keys: {diarize_segments.keys() if hasattr(diarize_segments, 'keys') else 'no keys'}")
                 result = whisperx.assign_word_speakers(diarize_segments, result)
+                diarization_ok = True
                 logger.info("Diarization basarili!")
             except Exception as e:
-                logger.warning(f"Konusmaci ayristirma hatasi: {e}")
+                logger.warning(f"Audio ile diarization hatasi: {e}")
+                try:
+                    logger.info("Wav path ile deneniyor...")
+                    diarize_segments = diarize_model(wav_path, min_speakers=min_speakers, max_speakers=max_speakers)
+                    result = whisperx.assign_word_speakers(diarize_segments, result)
+                    diarization_ok = True
+                    logger.info("Diarization wav_path ile basarili!")
+                except Exception as e2:
+                    logger.error(f"Wav path ile de diarization hatasi: {e2}")
+        elif diarize_model is None:
+            logger.error("DIARIZE MODEL NONE - yuklenmemis!")
 
         # Rename speakers: most talking = TEACHER
         raw_segments = result["segments"]
@@ -104,6 +128,9 @@ def handler(job):
             sp = seg.get("speaker", "UNKNOWN")
             dur = seg["end"] - seg["start"]
             speaker_durations[sp] = speaker_durations.get(sp, 0) + dur
+        
+        logger.info(f"Speaker durations: {speaker_durations}")
+        
         sorted_speakers = sorted(speaker_durations.items(), key=lambda x: x[1], reverse=True)
         speaker_map = {}
         for i, (sp, dur) in enumerate(sorted_speakers):
@@ -111,6 +138,8 @@ def handler(job):
                 speaker_map[sp] = "TEACHER"
             else:
                 speaker_map[sp] = "STUDENT"
+        
+        logger.info(f"Speaker map: {speaker_map}")
 
         segments = []
         for seg in raw_segments:
@@ -144,7 +173,8 @@ def handler(job):
             "speakers": speakers,
             "segment_count": len(segments),
             "full_text": full_text,
-            "speaker_text": speaker_text
+            "speaker_text": speaker_text,
+            "diarization_ok": diarization_ok
         }
 
         if webhook_url:
