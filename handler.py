@@ -156,10 +156,16 @@ def handler(job):
                 curr_text = curr.get("text", "").strip()
                 
                 # If both labeled as teacher, current is short, and previous ends with ? or is a prompt
+                gap = curr["start"] - prev["end"]
+                is_question = prev_text.endswith("?")
+                is_prompt = any(w in prev_text.lower() for w in ["say it", "repeat", "again", "what", "choose", "yes or no", "yes no", "is it", "do you", "can you", "tell me", "let's say", "one more"])
+                is_short = len(curr_text.split()) <= 8 and curr_duration < 6
+                is_echo = curr_text.lower().strip(".") in prev_text.lower()
+                
                 if (curr_speaker == teacher_name and prev_speaker == teacher_name 
-                    and curr_duration < 4
-                    and len(curr_text.split()) <= 5
-                    and (prev_text.endswith("?") or "say it" in prev_text.lower() or "repeat" in prev_text.lower() or "what" in prev_text.lower() or "choose" in prev_text.lower())):
+                    and gap < 3
+                    and is_short
+                    and (is_question or is_prompt or is_echo)):
                     raw_segments[i]["speaker"] = student_name
                     logger.info(f"Relabeled to STUDENT: {curr_text}")
         
