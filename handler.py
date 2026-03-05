@@ -165,6 +165,29 @@ def handler(job):
         
         logger.info(f"Post-processing tamamlandi")
 
+        # Post-processing: short responses after teacher questions = STUDENT
+        teacher_name = sorted_speakers[0][0] if sorted_speakers else None
+        student_name = sorted_speakers[1][0] if len(sorted_speakers) > 1 else None
+        
+        if teacher_name and student_name:
+            for i in range(1, len(raw_segments)):
+                prev = raw_segments[i-1]
+                curr = raw_segments[i]
+                curr_duration = curr["end"] - curr["start"]
+                curr_speaker = curr.get("speaker", "UNKNOWN")
+                prev_speaker = prev.get("speaker", "UNKNOWN")
+                prev_text = prev.get("text", "").strip()
+                curr_text = curr.get("text", "").strip()
+                
+                if (curr_speaker == teacher_name and prev_speaker == teacher_name 
+                    and curr_duration < 4
+                    and len(curr_text.split()) <= 5
+                    and (prev_text.endswith("?") or "say it" in prev_text.lower() or "repeat" in prev_text.lower() or "what" in prev_text.lower() or "choose" in prev_text.lower())):
+                    raw_segments[i]["speaker"] = student_name
+                    logger.info(f"Relabeled to STUDENT: {curr_text}")
+        
+        logger.info(f"Post-processing tamamlandi")
+
         segments = []
         for seg in raw_segments:
             segments.append({
