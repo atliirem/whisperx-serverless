@@ -24,3 +24,4 @@ jobs:
           tags: irematli/whisperx-serverless:v8
           build-args: |
             HF_TOKEN=${{ secrets.HF_TOKEN }}
+
