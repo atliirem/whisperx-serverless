@@ -73,62 +73,20 @@ def handler(job):
     tmp_path = None
     wav_path = None
 
-    def send_webhook(payload):
-        if webhook_url:
-            try:
-                req.post(webhook_url, json=payload, timeout=30)
-                logger.info(f"Webhook gonderildi: success={payload.get('success')}")
-            except Exception as e:
-                logger.error(f"Webhook hatasi: {e}")
-
     try:
         if not file_url:
-            payload = {"success": False, "error": "file_url gerekli", "filename": filename}
-            send_webhook(payload)
-            return payload
+            return {"success": False, "error": "file_url gerekli"}
 
         logger.info(f"Indiriliyor: {filename or file_url[:50]}")
         tmp_path = download_file(file_url)
         file_size_mb = os.path.getsize(tmp_path) / (1024 * 1024)
 
         wav_path = preprocess_audio(tmp_path)
-        wav_size = os.path.getsize(wav_path) / (1024 * 1024)
-        logger.info(f"WAV dosya boyutu: {round(wav_size, 1)} MB")
-
-        # FIX: Minimum dosya boyutu kontrolu (bozuk/bos dosya)
-        if wav_size < 0.01:
-            payload = {
-                "success": False,
-                "error": "Ses dosyasi bos veya bozuk (< 10KB)",
-                "filename": filename,
-                "file_size_mb": round(file_size_mb, 1),
-                "processing_time_seconds": round(time.time() - start_time, 1)
-            }
-            send_webhook(payload)
-            return payload
+        logger.info(f"WAV dosya boyutu: {round(os.path.getsize(wav_path)/(1024*1024),1)} MB")
 
         logger.info("Adim 1/3: Transkripsiyon...")
         audio = whisperx.load_audio(wav_path)
         result = model.transcribe(audio, language=language, batch_size=16)
-
-        # FIX: Bos transkript kontrolu — erken hata don
-        if not result.get("segments"):
-            elapsed = round(time.time() - start_time, 1)
-            logger.error(f"Transkripsiyon bos dondu! Dosya: {filename}, Boyut: {round(file_size_mb,1)} MB")
-            payload = {
-                "success": False,
-                "error": "Transkripsiyon bos - ses dosyasinda konusma bulunamadi veya format desteklenmiyor",
-                "filename": filename,
-                "file_size_mb": round(file_size_mb, 1),
-                "processing_time_seconds": elapsed,
-                "segments": [],
-                "full_text": "",
-                "speaker_text": ""
-            }
-            send_webhook(payload)
-            return payload
-
-        logger.info(f"Transkripsiyon tamamlandi: {len(result['segments'])} segment")
 
         logger.info("Adim 2/3: Kelime hizalama...")
         try:
@@ -143,25 +101,23 @@ def handler(job):
         diarization_ok = False
         if do_diarize and diarize_model is not None:
             logger.info("Adim 3/3: Konusmaci ayristirma...")
-
-            # FIX: Once wav_path ile dene (daha stabil), sonra audio array
             try:
-                logger.info("Diarization wav_path ile deneniyor...")
-                diarize_segments = diarize_model(wav_path, min_speakers=min_speakers, max_speakers=max_speakers)
+                diarize_segments = diarize_model(audio, min_speakers=min_speakers, max_speakers=max_speakers)
+                logger.info(f"Diarize segments type: {type(diarize_segments)}")
+                logger.info(f"Diarize segments keys: {diarize_segments.keys() if hasattr(diarize_segments, 'keys') else 'no keys'}")
                 result = whisperx.assign_word_speakers(diarize_segments, result)
                 diarization_ok = True
-                logger.info("Diarization basarili (wav_path)!")
+                logger.info("Diarization basarili!")
             except Exception as e:
-                logger.warning(f"wav_path ile diarization hatasi: {e}")
+                logger.warning(f"Audio ile diarization hatasi: {e}")
                 try:
-                    logger.info("Diarization audio array ile deneniyor...")
-                    diarize_segments = diarize_model(audio, min_speakers=min_speakers, max_speakers=max_speakers)
+                    logger.info("Wav path ile deneniyor...")
+                    diarize_segments = diarize_model(wav_path, min_speakers=min_speakers, max_speakers=max_speakers)
                     result = whisperx.assign_word_speakers(diarize_segments, result)
                     diarization_ok = True
-                    logger.info("Diarization basarili (audio array)!")
+                    logger.info("Diarization wav_path ile basarili!")
                 except Exception as e2:
-                    logger.error(f"Diarization tamamen basarisiz: {e2}")
-                    # Diarization olmadan devam et, transkripti kaybetme
+                    logger.error(f"Wav path ile de diarization hatasi: {e2}")
         elif diarize_model is None:
             logger.error("DIARIZE MODEL NONE - yuklenmemis!")
 
@@ -172,9 +128,9 @@ def handler(job):
             sp = seg.get("speaker", "UNKNOWN")
             dur = seg["end"] - seg["start"]
             speaker_durations[sp] = speaker_durations.get(sp, 0) + dur
-
+        
         logger.info(f"Speaker durations: {speaker_durations}")
-
+        
         sorted_speakers = sorted(speaker_durations.items(), key=lambda x: x[1], reverse=True)
         speaker_map = {}
         for i, (sp, dur) in enumerate(sorted_speakers):
@@ -182,14 +138,13 @@ def handler(job):
                 speaker_map[sp] = "TEACHER"
             else:
                 speaker_map[sp] = "STUDENT"
-
+        
         logger.info(f"Speaker map: {speaker_map}")
 
         # Post-processing: short responses after teacher questions = STUDENT
-        # FIX: Tek seferlik calistir (onceki kodda iki kez calisiyordu)
         teacher_name = sorted_speakers[0][0] if sorted_speakers else None
         student_name = sorted_speakers[1][0] if len(sorted_speakers) > 1 else None
-
+        
         if teacher_name and student_name:
             for i in range(1, len(raw_segments)):
                 prev = raw_segments[i-1]
@@ -199,25 +154,45 @@ def handler(job):
                 prev_speaker = prev.get("speaker", "UNKNOWN")
                 prev_text = prev.get("text", "").strip()
                 curr_text = curr.get("text", "").strip()
-
+                
+                # If both labeled as teacher, current is short, and previous ends with ? or is a prompt
                 gap = curr["start"] - prev["end"]
                 is_question = prev_text.endswith("?")
-                is_prompt = any(w in prev_text.lower() for w in [
-                    "say it", "repeat", "again", "what", "choose",
-                    "yes or no", "yes no", "is it", "do you", "can you",
-                    "tell me", "let's say", "one more"
-                ])
+                is_prompt = any(w in prev_text.lower() for w in ["say it", "repeat", "again", "what", "choose", "yes or no", "yes no", "is it", "do you", "can you", "tell me", "let's say", "one more"])
                 is_short = len(curr_text.split()) <= 8 and curr_duration < 6
                 is_echo = curr_text.lower().strip(".") in prev_text.lower()
-
-                if (curr_speaker == teacher_name and prev_speaker == teacher_name
-                        and gap < 3
-                        and is_short
-                        and (is_question or is_prompt or is_echo)):
+                
+                if (curr_speaker == teacher_name and prev_speaker == teacher_name 
+                    and gap < 3
+                    and is_short
+                    and (is_question or is_prompt or is_echo)):
                     raw_segments[i]["speaker"] = student_name
                     logger.info(f"Relabeled to STUDENT: {curr_text}")
+        
+        logger.info(f"Post-processing tamamlandi")
 
-        logger.info("Post-processing tamamlandi")
+        # Post-processing: short responses after teacher questions = STUDENT
+        teacher_name = sorted_speakers[0][0] if sorted_speakers else None
+        student_name = sorted_speakers[1][0] if len(sorted_speakers) > 1 else None
+        
+        if teacher_name and student_name:
+            for i in range(1, len(raw_segments)):
+                prev = raw_segments[i-1]
+                curr = raw_segments[i]
+                curr_duration = curr["end"] - curr["start"]
+                curr_speaker = curr.get("speaker", "UNKNOWN")
+                prev_speaker = prev.get("speaker", "UNKNOWN")
+                prev_text = prev.get("text", "").strip()
+                curr_text = curr.get("text", "").strip()
+                
+                if (curr_speaker == teacher_name and prev_speaker == teacher_name 
+                    and curr_duration < 4
+                    and len(curr_text.split()) <= 5
+                    and (prev_text.endswith("?") or "say it" in prev_text.lower() or "repeat" in prev_text.lower() or "what" in prev_text.lower() or "choose" in prev_text.lower())):
+                    raw_segments[i]["speaker"] = student_name
+                    logger.info(f"Relabeled to STUDENT: {curr_text}")
+        
+        logger.info(f"Post-processing tamamlandi")
 
         segments = []
         for seg in raw_segments:
@@ -255,26 +230,36 @@ def handler(job):
             "diarization_ok": diarization_ok
         }
 
-        send_webhook(payload)
-        logger.info(f"Tamamlandi! Sure: {elapsed}s | Segmentler: {len(segments)} | Diarization: {diarization_ok}")
+        if webhook_url:
+            try:
+                req.post(webhook_url, json=payload, timeout=30)
+                logger.info(f"Webhook gonderildi! Sure: {elapsed}s")
+            except Exception as e:
+                logger.error(f"Webhook hatasi: {e}")
+
+        logger.info(f"Tamamlandi! Sure: {elapsed}s")
         return payload
 
     except Exception as e:
         elapsed = round(time.time() - start_time, 1)
-        logger.error(f"Kritik hata: {e}", exc_info=True)
-        payload = {
+        logger.error(f"Hata: {e}")
+        error_payload = {
             "success": False,
             "filename": filename,
             "error": str(e),
             "processing_time_seconds": elapsed
         }
-        send_webhook(payload)
-        return payload
+        if webhook_url:
+            try:
+                req.post(webhook_url, json=error_payload, timeout=30)
+            except:
+                pass
+        return error_payload
 
     finally:
         for f in [tmp_path, wav_path]:
             try:
-                if f and os.path.exists(f):
+                if f:
                     os.unlink(f)
             except:
                 pass
