@@ -21,12 +21,12 @@ diarize_model = None
 if HF_TOKEN:
     logger.info("Diarization modeli yukleniyor...")
     try:
-        diarize_model = whisperx.DiarizePipeline(use_auth_token=HF_TOKEN, device=DEVICE)
+        from whisperx.diarize import DiarizePipeline; diarize_model = DiarizePipeline(use_auth_token=HF_TOKEN, device=DEVICE)
         logger.info("Diarization modeli hazir (GPU)!")
     except Exception as e:
         logger.error(f"Diarization yuklenemedi: {e}")
         try:
-            diarize_model = whisperx.DiarizePipeline(token=HF_TOKEN, device=DEVICE)
+            from whisperx.diarize import DiarizePipeline; diarize_model = DiarizePipeline(token=HF_TOKEN, device=DEVICE)
             logger.info("Diarization modeli hazir (token param)!")
         except Exception as e2:
             logger.error(f"Diarization token ile de yuklenemedi: {e2}")
