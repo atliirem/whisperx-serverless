@@ -21,15 +21,12 @@ diarize_model = None
 if HF_TOKEN:
     logger.info("Diarization modeli yukleniyor...")
     try:
-        from whisperx.diarize import DiarizePipeline; diarize_model = DiarizePipeline(use_auth_token=HF_TOKEN, device=DEVICE)
-        logger.info("Diarization modeli hazir (GPU)!")
+        from pyannote.audio import Pipeline
+        diarize_model = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", token=HF_TOKEN)
+        diarize_model.to(torch.device(DEVICE))
+        logger.info("Diarization modeli hazir (pyannote GPU)!")
     except Exception as e:
         logger.error(f"Diarization yuklenemedi: {e}")
-        try:
-            from whisperx.diarize import DiarizePipeline; diarize_model = DiarizePipeline(token=HF_TOKEN, device=DEVICE)
-            logger.info("Diarization modeli hazir (token param)!")
-        except Exception as e2:
-            logger.error(f"Diarization token ile de yuklenemedi: {e2}")
 else:
     logger.warning("HF_TOKEN yok, diarization calismayacak!")
 
@@ -95,7 +92,6 @@ def handler(job):
         wav_size = os.path.getsize(wav_path) / (1024 * 1024)
         logger.info(f"WAV dosya boyutu: {round(wav_size, 1)} MB")
 
-        # FIX: Minimum dosya boyutu kontrolu (bozuk/bos dosya)
         if wav_size < 0.01:
             payload = {
                 "success": False,
@@ -111,17 +107,15 @@ def handler(job):
         audio = whisperx.load_audio(wav_path)
         result = model.transcribe(audio, language=language, batch_size=16)
 
-        # FIX: Bos transkript kontrolu — erken hata don
         if not result.get("segments"):
             elapsed = round(time.time() - start_time, 1)
-            logger.error(f"Transkripsiyon bos dondu! Dosya: {filename}, Boyut: {round(file_size_mb,1)} MB")
+            logger.error(f"Transkripsiyon bos dondu! Dosya: {filename}")
             payload = {
                 "success": False,
-                "error": "Transkripsiyon bos - ses dosyasinda konusma bulunamadi veya format desteklenmiyor",
+                "error": "Transkripsiyon bos - ses dosyasinda konusma bulunamadi",
                 "filename": filename,
                 "file_size_mb": round(file_size_mb, 1),
                 "processing_time_seconds": elapsed,
-                "segments": [],
                 "full_text": "",
                 "speaker_text": ""
             }
@@ -143,25 +137,23 @@ def handler(job):
         diarization_ok = False
         if do_diarize and diarize_model is not None:
             logger.info("Adim 3/3: Konusmaci ayristirma...")
-
-            # FIX: Once wav_path ile dene (daha stabil), sonra audio array
             try:
-                logger.info("Diarization wav_path ile deneniyor...")
-                diarize_segments = diarize_model(wav_path, min_speakers=min_speakers, max_speakers=max_speakers)
-                result = whisperx.assign_word_speakers(diarize_segments, result)
+                import torchaudio
+                import pandas as pd
+                waveform, sr = torchaudio.load(wav_path)
+                raw = diarize_model(
+                    {"waveform": waveform.to(DEVICE), "sample_rate": sr},
+                    min_speakers=min_speakers, max_speakers=max_speakers
+                )
+                diarize_df = pd.DataFrame(
+                    [(t.start, t.end, s) for t, _, s in raw.itertracks(yield_label=True)],
+                    columns=["start", "end", "speaker"]
+                )
+                result = whisperx.assign_word_speakers(diarize_df, result)
                 diarization_ok = True
-                logger.info("Diarization basarili (wav_path)!")
+                logger.info("Diarization basarili!")
             except Exception as e:
-                logger.warning(f"wav_path ile diarization hatasi: {e}")
-                try:
-                    logger.info("Diarization audio array ile deneniyor...")
-                    diarize_segments = diarize_model(audio, min_speakers=min_speakers, max_speakers=max_speakers)
-                    result = whisperx.assign_word_speakers(diarize_segments, result)
-                    diarization_ok = True
-                    logger.info("Diarization basarili (audio array)!")
-                except Exception as e2:
-                    logger.error(f"Diarization tamamen basarisiz: {e2}")
-                    # Diarization olmadan devam et, transkripti kaybetme
+                logger.error(f"Diarization hatasi: {e}")
         elif diarize_model is None:
             logger.error("DIARIZE MODEL NONE - yuklenmemis!")
 
@@ -186,7 +178,6 @@ def handler(job):
         logger.info(f"Speaker map: {speaker_map}")
 
         # Post-processing: short responses after teacher questions = STUDENT
-        # FIX: Tek seferlik calistir (onceki kodda iki kez calisiyordu)
         teacher_name = sorted_speakers[0][0] if sorted_speakers else None
         student_name = sorted_speakers[1][0] if len(sorted_speakers) > 1 else None
 
@@ -256,7 +247,7 @@ def handler(job):
         }
 
         send_webhook(payload)
-        logger.info(f"Tamamlandi! Sure: {elapsed}s | Segmentler: {len(segments)} | Diarization: {diarization_ok}")
+        logger.info(f"Tamamlandi! Sure: {elapsed}s | Diarization: {diarization_ok}")
         return payload
 
     except Exception as e:
