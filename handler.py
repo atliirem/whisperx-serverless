@@ -1,6 +1,7 @@
 import os, gc, time, tempfile, subprocess, logging
 import requests as req
 import runpod
+import numpy as np
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("whisperx-serverless")
@@ -56,21 +57,16 @@ def download_file(url):
 
 
 def extract_diarization(raw):
-    """Extract speaker segments from pyannote output, handling both v3 and v4 API"""
     import pandas as pd
-    
-    # Try different pyannote output formats
     tracks = None
-    
-    # Method 1: Direct itertracks (pyannote 3.x)
+
     if hasattr(raw, 'itertracks'):
         try:
             tracks = [(t.start, t.end, s) for t, _, s in raw.itertracks(yield_label=True)]
             logger.info(f"Diarization: itertracks ile {len(tracks)} segment bulundu")
         except Exception as e:
             logger.warning(f"itertracks hatasi: {e}")
-    
-    # Method 2: speaker_diarization attribute (pyannote 4.x)
+
     if tracks is None and hasattr(raw, 'speaker_diarization'):
         try:
             sd = raw.speaker_diarization
@@ -79,11 +75,9 @@ def extract_diarization(raw):
                 logger.info(f"Diarization: speaker_diarization.itertracks ile {len(tracks)} segment bulundu")
         except Exception as e:
             logger.warning(f"speaker_diarization.itertracks hatasi: {e}")
-    
-    # Method 3: Try to iterate raw as annotation
+
     if tracks is None:
         try:
-            # Some versions return annotation directly
             for attr_name in dir(raw):
                 attr = getattr(raw, attr_name)
                 if hasattr(attr, 'itertracks'):
@@ -92,21 +86,88 @@ def extract_diarization(raw):
                     break
         except Exception as e:
             logger.warning(f"Fallback itertracks hatasi: {e}")
-    
-    # Method 4: Log all attributes to debug
+
     if tracks is None:
         logger.error(f"Diarization output type: {type(raw)}")
-        logger.error(f"Diarization output dir: {[a for a in dir(raw) if not a.startswith('_')]}")
-        try:
-            logger.error(f"Diarization output str: {str(raw)[:500]}")
-        except:
-            pass
-        raise ValueError(f"Diarization ciktisi isle namadi. Type: {type(raw)}")
-    
+        raise ValueError(f"Diarization ciktisi islenemedi. Type: {type(raw)}")
+
     if not tracks:
         raise ValueError("Diarization hicbir konusmaci bulamadi")
-    
+
     return pd.DataFrame(tracks, columns=["start", "end", "speaker"])
+
+
+def get_pitch(audio_array, sr=16000):
+    """Calculate fundamental frequency (F0) using autocorrelation"""
+    # Only analyze segments with enough energy (voice activity)
+    if len(audio_array) < sr * 0.05:  # minimum 50ms
+        return 0
+
+    # Normalize
+    audio_array = audio_array.astype(np.float64)
+    if np.max(np.abs(audio_array)) == 0:
+        return 0
+    audio_array = audio_array / np.max(np.abs(audio_array))
+
+    # Use autocorrelation for pitch detection
+    # F0 range: 80 Hz (deep male) to 500 Hz (child)
+    min_lag = int(sr / 500)  # 500 Hz -> highest pitch
+    max_lag = int(sr / 80)   # 80 Hz -> lowest pitch
+
+    if max_lag >= len(audio_array):
+        return 0
+
+    # Autocorrelation
+    corr = np.correlate(audio_array, audio_array, mode='full')
+    corr = corr[len(corr)//2:]  # Take positive lags only
+
+    if max_lag >= len(corr):
+        return 0
+
+    # Find peak in valid range
+    search_range = corr[min_lag:max_lag]
+    if len(search_range) == 0:
+        return 0
+
+    peak_idx = np.argmax(search_range) + min_lag
+    if corr[peak_idx] <= 0:
+        return 0
+
+    f0 = sr / peak_idx
+    return f0
+
+
+def analyze_speaker_pitch(audio_array, segments, speaker_name, sr=16000):
+    """Calculate average pitch for a specific speaker's segments"""
+    pitches = []
+
+    for seg in segments:
+        if seg.get("speaker") != speaker_name:
+            continue
+
+        start_sample = int(seg["start"] * sr)
+        end_sample = int(seg["end"] * sr)
+
+        if end_sample > len(audio_array):
+            end_sample = len(audio_array)
+        if start_sample >= end_sample:
+            continue
+
+        chunk = audio_array[start_sample:end_sample]
+
+        # Split into 200ms windows for better pitch estimation
+        window_size = int(0.2 * sr)
+        for j in range(0, len(chunk) - window_size, window_size):
+            window = chunk[j:j+window_size]
+            f0 = get_pitch(window, sr)
+            if 80 < f0 < 500:  # Valid voice range
+                pitches.append(f0)
+
+    if not pitches:
+        return 0
+
+    # Use median to be robust against outliers
+    return float(np.median(pitches))
 
 
 def handler(job):
@@ -207,58 +268,60 @@ def handler(job):
         elif diarize_model is None:
             logger.error("DIARIZE MODEL NONE - yuklenmemis!")
 
-        # Rename speakers: most talking = TEACHER
+        # Identify speakers using PITCH analysis
         raw_segments = result["segments"]
-        speaker_durations = {}
-        for seg in raw_segments:
-            sp = seg.get("speaker", "UNKNOWN")
-            dur = seg["end"] - seg["start"]
-            speaker_durations[sp] = speaker_durations.get(sp, 0) + dur
+        unique_speakers = list(set(seg.get("speaker", "UNKNOWN") for seg in raw_segments))
+        logger.info(f"Unique speakers: {unique_speakers}")
 
-        logger.info(f"Speaker durations: {speaker_durations}")
-
-        sorted_speakers = sorted(speaker_durations.items(), key=lambda x: x[1], reverse=True)
         speaker_map = {}
-        for i, (sp, dur) in enumerate(sorted_speakers):
-            if i == 0:
-                speaker_map[sp] = "TEACHER"
+
+        if len(unique_speakers) >= 2 and diarization_ok:
+            # Analyze pitch for each speaker
+            speaker_pitches = {}
+            for sp in unique_speakers:
+                if sp == "UNKNOWN":
+                    continue
+                avg_pitch = analyze_speaker_pitch(audio, raw_segments, sp, sr=16000)
+                speaker_pitches[sp] = avg_pitch
+                logger.info(f"Speaker {sp} ortalama pitch: {round(avg_pitch, 1)} Hz")
+
+            # Higher pitch = child (STUDENT), lower pitch = adult (TEACHER)
+            valid_pitches = {sp: p for sp, p in speaker_pitches.items() if p > 0}
+
+            if len(valid_pitches) >= 2:
+                sorted_by_pitch = sorted(valid_pitches.items(), key=lambda x: x[1])
+                # Lowest pitch = TEACHER (adult)
+                # Highest pitch = STUDENT (child)
+                speaker_map[sorted_by_pitch[0][0]] = "TEACHER"
+                speaker_map[sorted_by_pitch[-1][0]] = "STUDENT"
+                logger.info(f"Pitch-based assignment: TEACHER={sorted_by_pitch[0][0]} ({round(sorted_by_pitch[0][1],1)} Hz), STUDENT={sorted_by_pitch[-1][0]} ({round(sorted_by_pitch[-1][1],1)} Hz)")
             else:
-                speaker_map[sp] = "STUDENT"
+                # Fallback: most talking = TEACHER
+                logger.warning("Pitch analizi basarisiz, sure bazli atama yapiliyor")
+                speaker_durations = {}
+                for seg in raw_segments:
+                    sp = seg.get("speaker", "UNKNOWN")
+                    dur = seg["end"] - seg["start"]
+                    speaker_durations[sp] = speaker_durations.get(sp, 0) + dur
+                sorted_speakers = sorted(speaker_durations.items(), key=lambda x: x[1], reverse=True)
+                for i, (sp, dur) in enumerate(sorted_speakers):
+                    speaker_map[sp] = "TEACHER" if i == 0 else "STUDENT"
+        else:
+            # No diarization or single speaker - fallback to duration
+            speaker_durations = {}
+            for seg in raw_segments:
+                sp = seg.get("speaker", "UNKNOWN")
+                dur = seg["end"] - seg["start"]
+                speaker_durations[sp] = speaker_durations.get(sp, 0) + dur
+            sorted_speakers = sorted(speaker_durations.items(), key=lambda x: x[1], reverse=True)
+            for i, (sp, dur) in enumerate(sorted_speakers):
+                speaker_map[sp] = "TEACHER" if i == 0 else "STUDENT"
 
-        logger.info(f"Speaker map: {speaker_map}")
+        # Ensure UNKNOWN maps to something
+        if "UNKNOWN" not in speaker_map:
+            speaker_map["UNKNOWN"] = "UNKNOWN"
 
-        # Post-processing: short responses after teacher questions = STUDENT
-        teacher_name = sorted_speakers[0][0] if sorted_speakers else None
-        student_name = sorted_speakers[1][0] if len(sorted_speakers) > 1 else None
-
-        if teacher_name and student_name:
-            for i in range(1, len(raw_segments)):
-                prev = raw_segments[i-1]
-                curr = raw_segments[i]
-                curr_duration = curr["end"] - curr["start"]
-                curr_speaker = curr.get("speaker", "UNKNOWN")
-                prev_speaker = prev.get("speaker", "UNKNOWN")
-                prev_text = prev.get("text", "").strip()
-                curr_text = curr.get("text", "").strip()
-
-                gap = curr["start"] - prev["end"]
-                is_question = prev_text.endswith("?")
-                is_prompt = any(w in prev_text.lower() for w in [
-                    "say it", "repeat", "again", "what", "choose",
-                    "yes or no", "yes no", "is it", "do you", "can you",
-                    "tell me", "let's say", "one more"
-                ])
-                is_short = len(curr_text.split()) <= 8 and curr_duration < 6
-                is_echo = curr_text.lower().strip(".") in prev_text.lower()
-
-                if (curr_speaker == teacher_name and prev_speaker == teacher_name
-                        and gap < 3
-                        and is_short
-                        and (is_question or is_prompt or is_echo)):
-                    raw_segments[i]["speaker"] = student_name
-                    logger.info(f"Relabeled to STUDENT: {curr_text}")
-
-        logger.info("Post-processing tamamlandi")
+        logger.info(f"Final speaker map: {speaker_map}")
 
         segments = []
         for seg in raw_segments:
