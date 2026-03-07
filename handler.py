@@ -55,6 +55,60 @@ def download_file(url):
     return tmp.name
 
 
+def extract_diarization(raw):
+    """Extract speaker segments from pyannote output, handling both v3 and v4 API"""
+    import pandas as pd
+    
+    # Try different pyannote output formats
+    tracks = None
+    
+    # Method 1: Direct itertracks (pyannote 3.x)
+    if hasattr(raw, 'itertracks'):
+        try:
+            tracks = [(t.start, t.end, s) for t, _, s in raw.itertracks(yield_label=True)]
+            logger.info(f"Diarization: itertracks ile {len(tracks)} segment bulundu")
+        except Exception as e:
+            logger.warning(f"itertracks hatasi: {e}")
+    
+    # Method 2: speaker_diarization attribute (pyannote 4.x)
+    if tracks is None and hasattr(raw, 'speaker_diarization'):
+        try:
+            sd = raw.speaker_diarization
+            if hasattr(sd, 'itertracks'):
+                tracks = [(t.start, t.end, s) for t, _, s in sd.itertracks(yield_label=True)]
+                logger.info(f"Diarization: speaker_diarization.itertracks ile {len(tracks)} segment bulundu")
+        except Exception as e:
+            logger.warning(f"speaker_diarization.itertracks hatasi: {e}")
+    
+    # Method 3: Try to iterate raw as annotation
+    if tracks is None:
+        try:
+            # Some versions return annotation directly
+            for attr_name in dir(raw):
+                attr = getattr(raw, attr_name)
+                if hasattr(attr, 'itertracks'):
+                    tracks = [(t.start, t.end, s) for t, _, s in attr.itertracks(yield_label=True)]
+                    logger.info(f"Diarization: {attr_name}.itertracks ile {len(tracks)} segment bulundu")
+                    break
+        except Exception as e:
+            logger.warning(f"Fallback itertracks hatasi: {e}")
+    
+    # Method 4: Log all attributes to debug
+    if tracks is None:
+        logger.error(f"Diarization output type: {type(raw)}")
+        logger.error(f"Diarization output dir: {[a for a in dir(raw) if not a.startswith('_')]}")
+        try:
+            logger.error(f"Diarization output str: {str(raw)[:500]}")
+        except:
+            pass
+        raise ValueError(f"Diarization ciktisi isle namadi. Type: {type(raw)}")
+    
+    if not tracks:
+        raise ValueError("Diarization hicbir konusmaci bulamadi")
+    
+    return pd.DataFrame(tracks, columns=["start", "end", "speaker"])
+
+
 def handler(job):
     job_input = job["input"]
     start_time = time.time()
@@ -139,16 +193,12 @@ def handler(job):
             logger.info("Adim 3/3: Konusmaci ayristirma...")
             try:
                 import torchaudio
-                import pandas as pd
                 waveform, sr = torchaudio.load(wav_path)
                 raw = diarize_model(
                     {"waveform": waveform.to(DEVICE), "sample_rate": sr},
                     min_speakers=min_speakers, max_speakers=max_speakers
                 )
-                diarize_df = pd.DataFrame(
-                    [(t.start, t.end, s) for t, _, s in raw.itertracks(yield_label=True)],
-                    columns=["start", "end", "speaker"]
-                )
+                diarize_df = extract_diarization(raw)
                 result = whisperx.assign_word_speakers(diarize_df, result)
                 diarization_ok = True
                 logger.info("Diarization basarili!")

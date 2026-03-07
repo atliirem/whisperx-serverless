@@ -21,7 +21,7 @@ jobs:
         with:
           context: .
           push: true
-          tags: irematli/whisperx-serverless:v10
+          tags: irematli/whisperx-serverless:v11
           build-args: |
             HF_TOKEN=${{ secrets.HF_TOKEN }}
 
