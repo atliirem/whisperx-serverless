@@ -11,7 +11,8 @@ RUN pip install --no-cache-dir \
     pyannote.audio \
     requests \
     soundfile \
-    pandas
+    pandas \
+    librosa
 
 RUN python -c "import whisperx; whisperx.load_model('large-v3', 'cpu', compute_type='float32')" || true
 
