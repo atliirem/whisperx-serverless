@@ -1,4 +1,4 @@
-import os, gc, time, tempfile, subprocess, logging
+import os, gc, time, tempfile, subprocess, logging, re
 import requests as req
 import runpod
 import numpy as np
@@ -37,7 +37,7 @@ def preprocess_audio(input_path):
     try:
         subprocess.run(
             ["ffmpeg", "-i", input_path, "-ar", "16000", "-ac", "1", "-f", "wav", output_path, "-y"],
-            capture_output=True, timeout=120
+            capture_output=True, timeout=300
         )
         if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
             return output_path
@@ -46,28 +46,90 @@ def preprocess_audio(input_path):
         return input_path
 
 
+def download_gdrive_large(file_id, output_path):
+    """Download large files from Google Drive, bypassing virus scan confirmation"""
+    session = req.Session()
+
+    # Step 1: Initial request
+    url = f"https://drive.google.com/uc?export=download&id={file_id}"
+    response = session.get(url, stream=True, timeout=60)
+
+    # Step 2: Check if we got a confirmation page (large file)
+    content_type = response.headers.get("Content-Type", "")
+
+    if "text/html" in content_type:
+        # Large file - need to extract confirmation token
+        logger.info("Buyuk dosya algilandi, onay token araniyor...")
+
+        page_content = response.text
+
+        # Try multiple patterns to find the confirmation token/URL
+        # Pattern 1: confirm=UUID
+        confirm_match = re.search(r'confirm=([0-9A-Za-z_-]+)', page_content)
+        if confirm_match:
+            confirm_token = confirm_match.group(1)
+            url_with_confirm = f"https://drive.google.com/uc?export=download&confirm={confirm_token}&id={file_id}"
+            logger.info(f"Onay token bulundu: {confirm_token}")
+            response = session.get(url_with_confirm, stream=True, timeout=300)
+        else:
+            # Pattern 2: Direct download URL in the page
+            download_match = re.search(r'href="(/uc\?export=download[^"]+)"', page_content)
+            if download_match:
+                download_url = "https://drive.google.com" + download_match.group(1).replace("&amp;", "&")
+                logger.info("Direkt indirme URL bulundu")
+                response = session.get(download_url, stream=True, timeout=300)
+            else:
+                # Pattern 3: uuid parameter
+                uuid_match = re.search(r'name="uuid" value="([^"]+)"', page_content)
+                if uuid_match:
+                    uuid_val = uuid_match.group(1)
+                    url_with_uuid = f"https://drive.google.com/uc?export=download&id={file_id}&uuid={uuid_val}&confirm=t"
+                    logger.info(f"UUID bulundu: {uuid_val}")
+                    response = session.get(url_with_uuid, stream=True, timeout=300)
+                else:
+                    # Last resort: just add confirm=t
+                    url_force = f"https://drive.google.com/uc?export=download&confirm=t&id={file_id}"
+                    logger.info("Token bulunamadi, confirm=t ile deneniyor")
+                    response = session.get(url_force, stream=True, timeout=300)
+
+    # Step 3: Download the actual file
+    with open(output_path, "wb") as f:
+        for chunk in response.iter_content(chunk_size=1024 * 1024):  # 1MB chunks
+            if chunk:
+                f.write(chunk)
+
+    size_mb = round(os.path.getsize(output_path) / (1024 * 1024), 1)
+    return size_mb
+
+
 def download_file(url, max_retries=3):
-    """Download file with gdown for Google Drive, fallback to requests"""
+    """Download file with multiple methods for Google Drive"""
     import gdown
+
+    # Extract Google Drive file ID
+    gdrive_id = None
+    if "drive.google.com" in url:
+        if "id=" in url:
+            gdrive_id = url.split("id=")[-1].split("&")[0]
+        elif "/d/" in url:
+            gdrive_id = url.split("/d/")[1].split("/")[0]
 
     last_error = None
     for attempt in range(1, max_retries + 1):
+        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        tmp.close()
+
         try:
-            tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-            tmp.close()
-
-            # Extract Google Drive file ID if present
-            gdrive_id = None
-            if "drive.google.com" in url:
-                if "id=" in url:
-                    gdrive_id = url.split("id=")[-1].split("&")[0]
-                elif "/d/" in url:
-                    gdrive_id = url.split("/d/")[1].split("/")[0]
-
             if gdrive_id:
-                gdown_url = f"https://drive.google.com/uc?id={gdrive_id}"
-                logger.info(f"gdown ile indiriliyor (deneme {attempt}): {gdrive_id}")
-                gdown.download(gdown_url, tmp.name, quiet=True, fuzzy=True)
+                # Method 1: gdown (handles most cases including large files)
+                if attempt <= 2:
+                    gdown_url = f"https://drive.google.com/uc?id={gdrive_id}"
+                    logger.info(f"gdown ile indiriliyor (deneme {attempt}): {gdrive_id}")
+                    gdown.download(gdown_url, tmp.name, quiet=False, fuzzy=True)
+                # Method 2: Manual confirmation bypass (fallback for very large files)
+                else:
+                    logger.info(f"Manuel indirme ile deneniyor (deneme {attempt}): {gdrive_id}")
+                    download_gdrive_large(gdrive_id, tmp.name)
             else:
                 r = req.get(url, timeout=300)
                 r.raise_for_status()
@@ -75,6 +137,19 @@ def download_file(url, max_retries=3):
                     f.write(r.content)
 
             size_mb = round(os.path.getsize(tmp.name) / (1024 * 1024), 1)
+
+            # Check if we got an HTML page instead of actual file
+            if size_mb < 0.1:
+                with open(tmp.name, "rb") as f:
+                    header = f.read(100)
+                if b"<!DOCTYPE" in header or b"<html" in header:
+                    logger.warning(f"Deneme {attempt}: HTML sayfasi indi, gercek dosya degil")
+                    os.unlink(tmp.name)
+                    if attempt < max_retries:
+                        time.sleep(5 * attempt)
+                        continue
+                    else:
+                        raise ValueError("Google Drive onay sayfasi asilamadi")
 
             if size_mb < 0.01:
                 logger.warning(f"Deneme {attempt}/{max_retries}: Dosya cok kucuk ({size_mb} MB)")
@@ -190,7 +265,6 @@ def identify_teacher_student(speaker_stats):
 
     speaker_list = list(speaker_stats.keys())
 
-    # Duration = primary signal (teacher ALWAYS talks more)
     duration_sorted = sorted(speaker_list, key=lambda sp: speaker_stats[sp]["duration"], reverse=True)
     teacher = duration_sorted[0]
     student = duration_sorted[1]
@@ -223,7 +297,6 @@ def correct_segments_by_pitch(segments, audio_array, teacher_name, student_name,
 
     pitch_diff = abs(student_pitch - teacher_pitch)
     if pitch_diff < 40:
-        logger.info(f"Pitch farki kucuk ({round(pitch_diff,1)} Hz), duzeltme atlanıyor")
         return segments, 0
 
     midpoint = (teacher_pitch + student_pitch) / 2
@@ -253,8 +326,6 @@ def correct_segments_by_pitch(segments, audio_array, teacher_name, student_name,
 
 
 def process_audio(audio, wav_path, language, min_speakers, max_speakers):
-    """Core processing: transcribe + align + diarize + identify speakers"""
-
     result = model.transcribe(audio, language=language, batch_size=16)
 
     if not result.get("segments"):
@@ -353,7 +424,6 @@ def handler(job):
             send_webhook(payload)
             return payload
 
-        # Download with gdown + retry
         logger.info(f"Indiriliyor: {filename or file_url[:50]}")
         tmp_path = download_file(file_url, max_retries=3)
         file_size_mb = os.path.getsize(tmp_path) / (1024 * 1024)
@@ -375,7 +445,6 @@ def handler(job):
 
         audio = whisperx.load_audio(wav_path)
 
-        # Process with retry
         logger.info("Isleme basliyor...")
         proc_result, error = process_audio(audio, wav_path, language, min_speakers, max_speakers)
 
@@ -405,7 +474,6 @@ def handler(job):
         diarization_ok = proc_result["diarization_ok"]
         id_info = proc_result["id_info"]
 
-        # Build output
         segments = []
         for seg in raw_segments:
             segments.append({
