@@ -47,39 +47,56 @@ def preprocess_audio(input_path):
 
 
 def download_file(url, max_retries=3):
-    """Download file with retry logic"""
+    """Download file with gdown for Google Drive, fallback to requests"""
+    import gdown
+
     last_error = None
     for attempt in range(1, max_retries + 1):
         try:
             tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-            r = req.get(url, timeout=300)
-            r.raise_for_status()
-            content = r.content
-            tmp.write(content)
             tmp.close()
-            size_mb = round(len(content) / (1024 * 1024), 1)
+
+            # Extract Google Drive file ID if present
+            gdrive_id = None
+            if "drive.google.com" in url:
+                if "id=" in url:
+                    gdrive_id = url.split("id=")[-1].split("&")[0]
+                elif "/d/" in url:
+                    gdrive_id = url.split("/d/")[1].split("/")[0]
+
+            if gdrive_id:
+                gdown_url = f"https://drive.google.com/uc?id={gdrive_id}"
+                logger.info(f"gdown ile indiriliyor (deneme {attempt}): {gdrive_id}")
+                gdown.download(gdown_url, tmp.name, quiet=True, fuzzy=True)
+            else:
+                r = req.get(url, timeout=300)
+                r.raise_for_status()
+                with open(tmp.name, "wb") as f:
+                    f.write(r.content)
+
+            size_mb = round(os.path.getsize(tmp.name) / (1024 * 1024), 1)
 
             if size_mb < 0.01:
-                logger.warning(f"Indirme denemesi {attempt}/{max_retries}: Dosya cok kucuk ({size_mb} MB)")
+                logger.warning(f"Deneme {attempt}/{max_retries}: Dosya cok kucuk ({size_mb} MB)")
                 os.unlink(tmp.name)
                 if attempt < max_retries:
-                    time.sleep(3 * attempt)  # 3s, 6s, 9s bekle
+                    time.sleep(5 * attempt)
                     continue
                 else:
-                    raise ValueError(f"Dosya {max_retries} denemede de bos indi ({size_mb} MB)")
+                    raise ValueError(f"{max_retries} denemede de bos indi")
 
             logger.info(f"Dosya indirildi: {size_mb} MB (deneme {attempt})")
             return tmp.name
 
         except Exception as e:
             last_error = e
-            logger.warning(f"Indirme denemesi {attempt}/{max_retries} basarisiz: {e}")
+            logger.warning(f"Deneme {attempt}/{max_retries} basarisiz: {e}")
             try:
                 os.unlink(tmp.name)
             except:
                 pass
             if attempt < max_retries:
-                time.sleep(3 * attempt)
+                time.sleep(5 * attempt)
 
     raise last_error or ValueError("Dosya indirilemedi")
 
@@ -182,7 +199,6 @@ def identify_teacher_student(speaker_stats):
     logger.info(f"Duration: {teacher}={round(speaker_stats[teacher]['duration'],1)}s, "
                 f"{student}={round(speaker_stats[student]['duration'],1)}s, ratio={round(dur_ratio,1)}x")
 
-    # Pitch info for logging
     for sp in [teacher, student]:
         if speaker_stats[sp]["median_pitch"] > 0:
             logger.info(f"Pitch {sp}: {round(speaker_stats[sp]['median_pitch'],1)} Hz")
@@ -238,7 +254,7 @@ def correct_segments_by_pitch(segments, audio_array, teacher_name, student_name,
 
 def process_audio(audio, wav_path, language, min_speakers, max_speakers):
     """Core processing: transcribe + align + diarize + identify speakers"""
-    
+
     result = model.transcribe(audio, language=language, batch_size=16)
 
     if not result.get("segments"):
@@ -246,7 +262,6 @@ def process_audio(audio, wav_path, language, min_speakers, max_speakers):
 
     logger.info(f"Transkripsiyon: {len(result['segments'])} segment")
 
-    # Align
     try:
         align_model, metadata = whisperx.load_align_model(language_code=language, device=DEVICE)
         result = whisperx.align(result["segments"], align_model, metadata, audio, device=DEVICE)
@@ -256,7 +271,6 @@ def process_audio(audio, wav_path, language, min_speakers, max_speakers):
     except Exception as e:
         logger.warning(f"Hizalama atlandi: {e}")
 
-    # Diarize
     diarization_ok = False
     if diarize_model is not None:
         try:
@@ -275,7 +289,6 @@ def process_audio(audio, wav_path, language, min_speakers, max_speakers):
 
     raw_segments = result["segments"]
 
-    # Speaker identification
     speaker_stats = analyze_speakers(audio, raw_segments, sr=16000)
     for sp, stats in speaker_stats.items():
         logger.info(f"  {sp}: dur={round(stats['duration'],1)}s, pitch={round(stats['median_pitch'],1)} Hz")
@@ -340,7 +353,7 @@ def handler(job):
             send_webhook(payload)
             return payload
 
-        # Download with retry
+        # Download with gdown + retry
         logger.info(f"Indiriliyor: {filename or file_url[:50]}")
         tmp_path = download_file(file_url, max_retries=3)
         file_size_mb = os.path.getsize(tmp_path) / (1024 * 1024)
@@ -362,12 +375,12 @@ def handler(job):
 
         audio = whisperx.load_audio(wav_path)
 
-        # Process with retry: if first attempt gives empty result, try once more
-        logger.info("Adim 1: Isleme basliyor...")
+        # Process with retry
+        logger.info("Isleme basliyor...")
         proc_result, error = process_audio(audio, wav_path, language, min_speakers, max_speakers)
 
         if error or proc_result is None:
-            logger.warning(f"Ilk deneme basarisiz: {error}. 5 saniye bekleyip tekrar deneniyor...")
+            logger.warning(f"Ilk deneme basarisiz: {error}. Tekrar deneniyor...")
             time.sleep(5)
             gc.collect()
             torch.cuda.empty_cache()
@@ -413,11 +426,10 @@ def handler(job):
         speakers = list(set(s["speaker"] for s in segments))
         elapsed = round(time.time() - start_time, 1)
 
-        # Final check: if speaker_text is empty, mark as failed
         if not speaker_text.strip():
             payload = {
                 "success": False,
-                "error": "Transkript bos - isleme basarili ama metin uretilmedi",
+                "error": "Transkript bos",
                 "filename": filename,
                 "file_size_mb": round(file_size_mb, 1),
                 "processing_time_seconds": elapsed,

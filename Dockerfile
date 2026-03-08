@@ -12,7 +12,8 @@ RUN pip install --no-cache-dir \
     requests \
     soundfile \
     pandas \
-    librosa
+    librosa \
+    gdown
 
 RUN python -c "import whisperx; whisperx.load_model('large-v3', 'cpu', compute_type='float32')" || true
 
