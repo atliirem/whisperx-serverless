@@ -10,6 +10,24 @@ COMPUTE_TYPE = "float16"
 MODEL_SIZE = os.environ.get("WHISPER_MODEL", "large-v3")
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
 
+# Default prompt for English lessons with young students
+DEFAULT_PROMPT = (
+    "This is an online English lesson between a teacher and a young student aged 4 to 15. "
+    "The teacher speaks clearly and slowly. The student is learning English and may make mistakes. "
+    "Common words and phrases: hello, goodbye, good morning, good afternoon, good evening, good night, "
+    "how are you, I am fine, thank you, yes, no, okay, please, sorry, "
+    "colors: red, blue, yellow, green, purple, orange, pink, brown, black, white, "
+    "animals: cat, dog, fish, bird, monkey, giraffe, zebra, elephant, lion, tiger, shark, dolphin, turtle, "
+    "school items: pencil, pen, eraser, ruler, book, bag, school bag, pencil case, desk, chair, window, "
+    "numbers: one, two, three, four, five, six, seven, eight, nine, ten, "
+    "family: mother, father, sister, brother, baby, "
+    "food: apple, banana, pizza, hamburger, chicken, rice, bread, milk, water, juice, "
+    "places: school, home, park, zoo, beach, playground, sea world, "
+    "verbs: like, want, have, see, eat, drink, play, swim, run, read, write, draw, sing, dance, "
+    "my name is, it is a, I like, I have, I want, do you like, what is this, where is, "
+    "very good, good job, well done, excellent, repeat after me, say it again, one more time."
+)
+
 import whisperx
 import torch
 
@@ -32,8 +50,6 @@ if HF_TOKEN:
 else:
     logger.warning("[INIT] HF_TOKEN yok!")
 
-
-# ── UTILS ──────────────────────────────────────────────
 
 def preprocess_audio(input_path):
     output_path = input_path + ".wav"
@@ -76,7 +92,6 @@ def download_file(url, max_retries=3):
 
             size_mb = round(os.path.getsize(tmp.name) / (1024 * 1024), 1)
 
-            # HTML kontrolu (Google Drive onay sayfasi)
             if size_mb < 0.5:
                 with open(tmp.name, "rb") as f:
                     header = f.read(200)
@@ -114,7 +129,6 @@ def download_file(url, max_retries=3):
 def extract_diarization(raw):
     import pandas as pd
 
-    # pyannote 3.x
     if hasattr(raw, 'itertracks'):
         try:
             tracks = [(t.start, t.end, s) for t, _, s in raw.itertracks(yield_label=True)]
@@ -124,7 +138,6 @@ def extract_diarization(raw):
         except:
             pass
 
-    # pyannote 4.x
     if hasattr(raw, 'speaker_diarization'):
         try:
             sd = raw.speaker_diarization
@@ -136,7 +149,6 @@ def extract_diarization(raw):
         except:
             pass
 
-    # Fallback: scan all attributes
     for name in dir(raw):
         obj = getattr(raw, name, None)
         if obj and hasattr(obj, 'itertracks'):
@@ -151,8 +163,6 @@ def extract_diarization(raw):
     raise ValueError(f"Diarization parse edilemedi: {type(raw)}")
 
 
-# ── HANDLER ────────────────────────────────────────────
-
 def handler(job):
     inp = job["input"]
     t0 = time.time()
@@ -164,6 +174,7 @@ def handler(job):
     max_sp = int(inp.get("max_speakers", 2))
     webhook_url = inp.get("webhook_url", "")
     filename = inp.get("filename", "")
+    prompt = inp.get("prompt", DEFAULT_PROMPT)
 
     tmp_path = None
     wav_path = None
@@ -185,11 +196,12 @@ def handler(job):
         return p
 
     try:
-        # ── 1. DOWNLOAD ───────────────────────────────
         if not file_url:
             return fail("file_url gerekli")
 
         logger.info(f"[JOB] Basliyor: {filename}")
+
+        # 1. DOWNLOAD
         tmp_path = download_file(file_url)
         file_size_mb = round(os.path.getsize(tmp_path) / (1024 * 1024), 1)
 
@@ -200,17 +212,22 @@ def handler(job):
         if wav_mb < 0.01:
             return fail("Ses dosyasi bos veya bozuk")
 
-        # ── 2. TRANSCRIBE ─────────────────────────────
+        # 2. TRANSCRIBE with initial_prompt
         logger.info("[1/3] Transkripsiyon...")
         audio = whisperx.load_audio(wav_path)
-        result = model.transcribe(audio, language=language, batch_size=16)
+        result = model.transcribe(
+            audio,
+            language=language,
+            batch_size=16,
+            initial_prompt=prompt
+        )
 
         if not result.get("segments"):
             return fail("Transkripsiyon bos")
 
         logger.info(f"[1/3] {len(result['segments'])} segment")
 
-        # ── 3. ALIGN ──────────────────────────────────
+        # 3. ALIGN
         logger.info("[2/3] Hizalama...")
         try:
             align_model, metadata = whisperx.load_align_model(
@@ -225,7 +242,7 @@ def handler(job):
         except Exception as e:
             logger.warning(f"[2/3] Hizalama atlandi: {e}")
 
-        # ── 4. DIARIZE ────────────────────────────────
+        # 4. DIARIZE
         diarization_ok = False
         if do_diarize and diarize_model is not None:
             logger.info("[3/3] Diarization...")
@@ -243,7 +260,7 @@ def handler(job):
             except Exception as e:
                 logger.error(f"[3/3] Diarization hatasi: {e}")
 
-        # ── 5. SPEAKER MAP (duration-based) ───────────
+        # 5. SPEAKER MAP (duration-based)
         segs = result["segments"]
         durations = {}
         for s in segs:
@@ -256,9 +273,9 @@ def handler(job):
             sp_map[sp] = "TEACHER" if i == 0 else "STUDENT"
         sp_map.setdefault("UNKNOWN", "UNKNOWN")
 
-        logger.info(f"[MAP] {sp_map} | Durations: {durations}")
+        logger.info(f"[MAP] {sp_map}")
 
-        # ── 6. BUILD OUTPUT ───────────────────────────
+        # 6. BUILD OUTPUT
         out = []
         for s in segs:
             out.append({
